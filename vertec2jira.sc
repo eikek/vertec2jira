@@ -33,7 +33,7 @@ import org.apache.poi.xssf.usermodel._
 
 /** The version of this script.
   */
-val version = "2018-12-12"
+val version = "2018-12-19"
 
 /** The pattern to look for jira ticket keys in the description of a
   * vertec item.
@@ -155,10 +155,9 @@ object App extends CaseApp[Options] {
     _.map({ case (input, result) =>
       println(s"Adding work on ${Colors.white(input.key)}, effort ${input.timeSpent} at ${input.started}")
       result match {
+        case ApplyResult.DrySuccess =>
+          println(Colors.grey(s"- Would add ${input.timeSeconds}s (${input.timeSpent}) to issue ${input.key}, but it's a dry-run"))
         case ApplyResult.Success =>
-          if (opts.dryRun) {
-            println(Colors.grey(s"- Would add ${input.timeSeconds}s (${input.timeSpent}) to issue ${input.key}, but it's a dry-run"))
-          }
           println(Colors.green("- ok"))
         case ApplyResult.TicketNotFound(key) =>
           println(Colors.lightRed(s"- The jira ticket was not found ($key)" ))
@@ -195,20 +194,13 @@ object XlsValue {
   case class Formula(value: String) extends XlsValue
 }
 
-sealed trait ApplyResult { def isSuccess: Boolean }
+sealed trait ApplyResult
 object ApplyResult {
-  case class TicketNotFound(key: String) extends ApplyResult {
-    val isSuccess = false
-  }
-  case class WorkItemPresent(item: WorkItem) extends ApplyResult {
-    val isSuccess = false
-  }
-  case class UnknownError(ex: Throwable) extends ApplyResult {
-    val isSuccess = false
-  }
-  case object Success extends ApplyResult {
-    val isSuccess = true
-  }
+  case class TicketNotFound(key: String) extends ApplyResult
+  case class WorkItemPresent(item: WorkItem) extends ApplyResult
+  case class UnknownError(ex: Throwable) extends ApplyResult
+  case object Success extends ApplyResult
+  case object DrySuccess extends ApplyResult
 }
 
 def extractIssues(s: String): List[String] =
@@ -388,19 +380,26 @@ def rowToWorkItem[F[_]: Sync](jiraUser: String)(row: RowInput): F[List[WorkItem]
 }
 
 def applyWorkItem[F[_]: Sync](dry: Boolean, jiraCred: JiraCred)(item: WorkItem): F[(WorkItem, ApplyResult)] = {
-  val checkTicket: F[(WorkItem, ApplyResult)] = findTicket[F](jiraCred)(item.key).
+  val checkTicket: F[ApplyResult] = findTicket[F](jiraCred)(item.key).
     flatMap({
-      case None => Sync[F].pure((item, ApplyResult.TicketNotFound(item.key)))
+      case None => Sync[F].pure(ApplyResult.TicketNotFound(item.key))
       case Some(_) => findWorklog(jiraCred)(item.key, item.started).map {
-        case None => (item, ApplyResult.Success)
-        case Some((_, pi)) => (item, ApplyResult.WorkItemPresent(pi))
+        case None => ApplyResult.Success
+        case Some((_, pi)) => ApplyResult.WorkItemPresent(pi)
       }
     })
-  val add = for {
-    result <- checkTicket
-    _      <- if (result._2.isSuccess && !dry) addWorklog(jiraCred)(item) else Sync[F].pure(())
-  } yield result
-  add.attempt.map(_.fold(ex => (item, ApplyResult.UnknownError(ex)), identity))
+
+  val z: F[ApplyResult] = checkTicket.
+    flatMap({
+      case ApplyResult.Success if dry =>
+        Sync[F].pure(ApplyResult.DrySuccess)
+      case ApplyResult.Success =>
+        addWorklog[F](jiraCred)(item).map(_ => ApplyResult.Success)
+      case res =>
+        Sync[F].pure(res)
+    })
+
+  z.attempt.map(_.fold(ex => (item, ApplyResult.UnknownError(ex)), r => (item, r)))
 }
 
 
